@@ -21,9 +21,11 @@ sign-on instead (see README).
 from __future__ import annotations
 
 import base64
+import datetime as dt
 import hashlib
 import os
 import secrets
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -33,8 +35,13 @@ import streamlit as st
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from fundplatform import lineage, pipeline, serving  # noqa: E402
+from fundplatform import lineage, pipeline, registry, serving  # noqa: E402
 from run import find_data  # noqa: E402
+
+try:                       # added after Day 3: older copies run without them (python update_platform.py adds them)
+    from fundplatform import equity, ingest  # noqa: E402
+except ImportError:
+    equity = ingest = None
 
 import yaml  # noqa: E402
 
@@ -43,13 +50,18 @@ ASSETS = HERE / "assets"
 
 # Who sees what. Page names are the keys of PAGES at the bottom of this file.
 ROLES = {
-    "Administrator": ["Home", "Overview", "Cash-flow plan", "Instruments", "Collections", "Data quality", "Users"],
-    "Finance office": ["Home", "Overview", "Cash-flow plan", "Instruments", "Collections", "Data quality"],
-    "Investment analyst": ["Home", "Overview", "Cash-flow plan", "Instruments", "Collections", "Data quality"],
-    "Chief Investment Officer": ["Home", "Overview", "Cash-flow plan", "Instruments", "Collections"],
-    "Board (read-only)": ["Home", "Overview", "Cash-flow plan"],
+    "Administrator": ["Home", "How to use", "Overview", "Cash-flow plan", "Instruments", "Collections",
+                      "Equity & dividends", "Data quality", "Import data", "Users"],
+    "Finance office": ["Home", "How to use", "Overview", "Cash-flow plan", "Instruments", "Collections",
+                       "Equity & dividends", "Data quality", "Import data"],
+    "Investment analyst": ["Home", "How to use", "Overview", "Cash-flow plan", "Instruments", "Collections",
+                           "Equity & dividends", "Data quality", "Import data"],
+    "Chief Investment Officer": ["Home", "How to use", "Overview", "Cash-flow plan", "Instruments", "Collections",
+                                 "Equity & dividends"],
+    "Board (read-only)": ["Home", "How to use", "Overview", "Cash-flow plan", "Equity & dividends"],
 }
 CAN_CHANGE_DATE = {"Administrator", "Finance office"}
+CAN_REPLACE_REGISTERS = {"Administrator", "Finance office"}   # analysts can check an import, not apply it
 DEFAULTS = {"learn_url": "https://kaineticslabs.com/learn",          # override any of these in config.yaml
             "contact_url": "https://kaineticslabs.com/work-with-us",
             "contact_email": "kaineticslabs@gmail.com",
@@ -189,8 +201,10 @@ def platform(as_of: str) -> dict:
     cfg.update(data_dir=find_data(cfg["data_dir"]), output_dir=HERE / cfg["output_dir"], as_of=as_of)
     ctx = pipeline.run(cfg, quiet=True)
     keep = ("board", "scorecard", "master", "status", "variance", "income", "upcoming", "extensions",
-            "spans", "lineage", "output_dir")
-    return {k: ctx[k] for k in keep}
+            "spans", "lineage", "output_dir", "exceptions", "cleaning_log", "as_of", "year", "data_dir")
+    p = {k: ctx[k] for k in keep if k in ctx}
+    p["equity"] = {k: ctx["reg"][k] for k in ("dividends", "equity_holdings") if k in ctx["reg"]}
+    return p
 
 
 # ------------------------------------------------------------------ home page (public and signed in)
@@ -203,10 +217,16 @@ FEATURES = [
      "90/60/30-day maturity alerts and a one-click lookup."),
     ("💰 Collections", "Cash expected in the next 30/60/90 days, budget vs actual collections with "
      "shortfalls highlighted, loan arrears and recovery rates."),
-    ("✅ Data quality & lineage", "Is the data fresh, valid, on budget and behaving as usual? And for any "
-     "figure: which sources it was built from, and what else a wrong source would affect."),
+    ("🌍 Equity & dividends", "The fund's stakes in 40 portfolio companies: dividends projected vs received "
+     "this year, overdue payers, income by year and a three-year baseline forecast."),
+    ("📥 Import from Excel", "Upload the registers as they are kept in Excel. The platform cleans what is safe "
+     "to clean, sets aside what needs a person, and says who should fix each row."),
+    ("✅ Data quality & lineage", "Is the data fresh, valid, on budget and behaving as usual? Which rows were "
+     "set aside? And for any figure: which sources it was built from, and what a wrong source would affect."),
     ("🔐 Accounts & roles", "Board members, the CIO, analysts and the finance office each see only what "
      "their role needs: role-based access, as an audit would expect."),
+    ("📖 How to use", "A short guide inside the app: which page answers which question, step-by-step tasks "
+     "for each role, and the terms used."),
 ]
 
 
@@ -236,8 +256,10 @@ synthetic.** Counterparties are called Bank A–I and Subsidiary A–C.
     cards(FEATURES)
     st.subheader("How it works")
     st.markdown("""
-1. **Registers:** the instrument lists (bonds, deposits, loans, exchange rates) are checked against
-   **data contracts** before use, so bad rows are stopped at the door.
+1. **Registers:** the instrument lists (bonds, deposits, loans, exchange rates, dividends) arrive as CSV
+   files or Excel workbooks. Formatting is **cleaned** (thousands separators, "10.5%", dd/mm/yyyy dates),
+   then every row is checked against its **data contract**. Rows that fail are **set aside as exceptions**,
+   each with the reason and the person who should fix it, and are left out of every figure until then.
 2. **Schedules:** every future and past payment of every instrument is computed once (*Actual/365* interest,
    equal-instalment loans), and every report is built from that one table.
 3. **Serving:** results are written as files for reports (*offline*) and as a fast lookup table for screens
@@ -248,16 +270,124 @@ synthetic.** Counterparties are called Bank A–I and Subsidiary A–C.
 """)
     st.subheader("Try it")
     st.markdown("Create an account (top of the page), choose a role, and sign in. "
-                "Each role sees a different set of pages. Sign out and sign up with another role to compare."
+                "Each role sees a different set of pages. Sign out and sign up with another role to compare. "
+                "New here? Read the **📖 How to use** tab first: two minutes."
                 if cfg["demo_mode"] else
-                "Sign in to explore. The first account on a new installation becomes Administrator.")
+                "Sign in to explore. The first account on a new installation becomes Administrator. "
+                "The **📖 How to use** tab explains every page.")
     st.write("")
     kainetics_section()
+
+
+# ------------------------------------------------------------------ the in-app guide ("How to use")
+PAGE_GUIDE = pd.DataFrame([
+    ("Overview", "How are we doing this year? What needs a decision soon?", "Everyone",
+     "Income cash vs accrual, cash due in 30 days, year-end cash, maturity alerts, any data warning"),
+    ("Cash-flow plan", "Will we have enough cash each month?", "Everyone",
+     "The 12-month plan; a warning on the first month the balance goes negative; download for Excel"),
+    ("Instruments", "What do we hold, and when does each one pay or mature?", "CIO, analysts, finance office",
+     "Every bond, deposit and loan; filter by asset class; look one instrument up"),
+    ("Collections", "Is the money that's due actually arriving?", "CIO, analysts, finance office",
+     "Due in 30/60/90 days, budget vs actual by month, arrears and recovery rates"),
+    ("Equity & dividends", "What do our companies pay us, and who is late?", "Everyone",
+     "Dividends projected vs received this year, overdue payers, income by year, 3-year baseline"),
+    ("Data quality", "Can we trust today's figures?", "Analysts, finance office",
+     "The scorecard, rows set aside (exceptions) with their owner, automatic fixes, lineage, the last run"),
+    ("Import data", "How do I bring in this month's Excel registers?", "Finance office, analysts",
+     "Upload a workbook or CSV; see fixes, exceptions and accepted rows before anything is used"),
+    ("Users", "Who has access, with which role?", "Administrator", "Change a person's role"),
+], columns=["Page", "The question it answers", "Who uses it", "What you'll find"])
+
+TASKS = [
+    ("🧭 Prepare for a board or investment-committee meeting (Board, CIO)", """
+1. **Overview**: read the four headline figures. A red banner means a data check failed; ask the finance
+   office before quoting those figures.
+2. **Cash-flow plan**: find the first month the closing balance turns negative (a yellow warning names it).
+   That is the decision to discuss: which maturities to keep as cash instead of reinvesting.
+3. **Equity & dividends**: the dividend income received this year, and any company that is late paying.
+4. Every **ℹ️** box under a page title explains the terms on that page.
+"""),
+    ("📥 Import this month's registers from Excel (Finance office, analysts)", """
+1. Name each sheet after its register: *Term Deposits*, *Treasury Bonds*, *Subsidiary Loans*, *FX Rates*,
+   *Dividends*… Column names are matched the same way ("Deposit ID" → `deposit_id`).
+2. Open **Import data** and upload the workbook (or a single CSV). Not ready yet? Click **Try it with the
+   sample workbook**: it's messy on purpose.
+3. Read the three results for each register:
+   - **Fixes made automatically**: formatting with only one possible meaning ("3,000,000,000", "10.5%",
+     15/10/2026, stray spaces, a TOTAL row). Each fix is listed, before and after.
+   - **Set aside (exceptions)**: anything that needs judgement (a rate typed as 10.8, an unknown bank, a missing
+     date, the same deposit twice). Each shows its Excel row, the problem and who should fix it.
+   - **Accepted rows**: what the platform will use.
+4. Correct the exceptions **in your workbook** and upload it again until nothing important is set aside.
+5. The finance office or an Administrator then clicks **Replace registers**. The previous files are kept as a
+   backup. (On the public demo nothing is saved.)
+"""),
+    ("🛠️ Fix a row that was set aside (owners named on the Data quality page)", """
+1. **Data quality → Exceptions** lists every row left out of today's figures: register, Excel row, key, the
+   field and the problem, and the owner.
+2. Correct the value at the source (the workbook or system it came from), then import it again.
+3. Until it is fixed, that row is **not** in any figure, and the Overview page shows a warning, so nobody
+   relies on an incomplete total without knowing.
+"""),
+    ("🔎 Find out where a figure came from (audit questions)", """
+1. **Data quality → Where does a figure come from?** Pick a dataset, e.g. `output/board_summary`.
+2. *Built from* lists every source behind it; *Feeds* lists everything a wrong source would affect.
+"""),
+    ("📅 Look at another date (Finance office, Administrator)", """
+Change **As of** in the left sidebar. Alerts, arrears, overdue dividends and "next 30 days" are recalculated
+as if today were that date. Other roles always see the official date.
+"""),
+    ("👥 Give a colleague access (Administrator)", """
+Ask them to create an account; they start as *Board (read-only)*. Then open **Users**, pick them and choose
+their role. The person who sets roles shouldn't also approve transactions (segregation of duties).
+"""),
+]
+
+GLOSSARY = """
+| Term | Meaning |
+|---|---|
+| Cash vs accrual | Interest *received* this year vs interest *earned* this year, whenever it's paid |
+| Maturity alert (30/60/90) | An instrument matures within that many days: time to decide whether to reinvest |
+| Register | A list the desk maintains: one row per bond, deposit, loan, rate or dividend |
+| Data contract | The agreed rules a register's rows must follow (required fields, types, allowed values) |
+| Exception | A row set aside because it breaks its contract; left out of every figure until corrected |
+| Cleaning | Safe formatting fixes with one possible meaning; every fix is logged |
+| Scorecard | The data-quality checks run every time: fresh, valid, on budget, behaving as usual |
+| Lineage | The record of which sources fed which figure |
+| RWF m | Rwandan francs, millions |
+"""
+
+
+def help_content(demo: bool) -> None:
+    st.header("📖 How to use the platform")
+    st.markdown("""
+**Start here (two minutes)**
+1. Choose a page in the **left sidebar**. You only see the pages your role needs.
+2. Under each page title, open **ℹ️ What does this page show** for the terms on that page.
+3. Coloured banners matter: **red** = a data check failed, treat the figures with care; **yellow** = a decision
+   is coming (a negative cash month, a late payer).
+4. Tables have a download button or icon: everything opens in Excel.
+""")
+    if demo:
+        st.info("**Public demo:** the data is synthetic, nothing you upload is saved, and accounts are removed "
+                "whenever the app restarts. To see every page, create accounts with different roles.")
+    st.subheader("Which page answers which question?")
+    st.dataframe(PAGE_GUIDE, hide_index=True, width="stretch")
+    st.subheader("Step by step")
+    for title, body in TASKS:
+        with st.expander(title):
+            st.markdown(body)
+    st.subheader("Words used in the platform")
+    st.markdown(GLOSSARY)
 
 
 # ------------------------------------------------------------------ pages for signed-in users
 def page_home(p: dict, user: dict) -> None:
     home_content()
+
+
+def page_help(p: dict, user: dict) -> None:
+    help_content(settings()["demo_mode"])
 
 
 def page_overview(p: dict, user: dict) -> None:
@@ -281,6 +411,10 @@ def page_overview(p: dict, user: dict) -> None:
     if len(breaches):
         st.error(f"{len(breaches)} data-quality breach(es): figures below may not be reliable. "
                  + "; ".join(f"{r.name} ({r.value})" for r in breaches.itertuples()))
+    exceptions = p.get("exceptions", pd.DataFrame())
+    if len(exceptions):
+        st.warning(f"{exceptions[['register', 'key']].drop_duplicates().shape[0]} register row(s) were set aside "
+                   "and are left out of every figure until corrected: see Data quality → Exceptions.")
     income = p["income"].groupby("asset_class")[["cash", "accrual"]].sum().div(1e6).round(1)
     income.index = income.index.str.replace("_", " ")
     st.subheader("Interest income by asset class (RWF m)")
@@ -364,11 +498,27 @@ def page_quality(p: dict, user: dict) -> None:
 - **Collections below budget:** months more than 10% short.
 - **Drift (PSI):** whether behaviour has changed, here how late payers are compared with last year.
   Below 0.1 stable, 0.1–0.25 moderate, above 0.25 significant.
+- **Exceptions:** register rows set aside because they break their contract, with the owner who should
+  correct them. They are left out of every figure until then.
+- **Automatic fixes:** formatting the platform cleaned on the way in (e.g. "10.5%" → 0.105), before and after.
 - **Lineage:** pick any dataset to see what it was built from (*upstream*) and what it feeds (*downstream*).
   If a source turns out to be wrong, downstream shows every report to correct.
 - **Last pipeline run:** each step, how long it took and whether it succeeded.
 """)
     st.dataframe(p["scorecard"], hide_index=True, width="stretch")
+    exceptions = p.get("exceptions")
+    if exceptions is not None:
+        st.subheader(f"Exceptions: rows set aside ({len(exceptions)})")
+        if len(exceptions):
+            st.dataframe(exceptions, hide_index=True, width="stretch")
+        else:
+            st.success("None: every register row passed its contract.")
+        fixes = pd.DataFrame(p.get("cleaning_log", []))
+        with st.expander(f"Automatic fixes in the last run ({len(fixes)})"):
+            if len(fixes):
+                st.dataframe(fixes, hide_index=True, width="stretch")
+            else:
+                st.write("None: the registers arrived clean.")
     st.subheader("Where does a figure come from? What does a source affect?")
     datasets = sorted({d["name"] for e in p["lineage"] for d in e["inputs"] + e["outputs"]})
     pick = st.selectbox("Dataset", datasets, index=datasets.index("output/board_summary"))
@@ -379,6 +529,148 @@ def page_quality(p: dict, user: dict) -> None:
     b.write(sorted(lineage.downstream(p["lineage"], pick)) or "nothing: it's a final output")
     st.subheader("Last pipeline run")
     st.dataframe(pd.DataFrame(p["spans"]), hide_index=True, width="stretch")
+
+
+def page_equity(p: dict, user: dict) -> None:
+    st.header("Equity & dividends")
+    explain("""
+- **Holdings:** the fund's stake in each portfolio company (FR-EQT-001).
+- **Projected vs received:** dividends due to the fund this year (its share of what each company declared)
+  against what has arrived (FR-EQT-003). **OVERDUE**: the payment date has passed and nothing has arrived.
+- **By fiscal year:** a company's dividend for fiscal year 2025 is declared and paid in 2026, after its audit.
+- **Next three years (baseline):** each company pays what it paid last time. It's the bar any forecasting
+  model must beat (FR-EQT-005, Capstone Day 4); a model that can't beat it shouldn't be used.
+""")
+    eq = p.get("equity", {})
+    if equity is None or "dividends" not in eq or "equity_holdings" not in eq:
+        st.info("Equity data isn't in this copy of the platform yet. Run `python update_platform.py`, "
+                "then restart the app.")
+        return
+    dividends, holdings = eq["dividends"], eq["equity_holdings"]
+    year, as_of = int(p.get("year", pd.Timestamp(p["as_of"]).year)), pd.Timestamp(p["as_of"])
+    inc = equity.income(dividends, holdings, year, as_of)
+    overdue = inc[inc.status == "OVERDUE"]
+    c = st.columns(4)
+    c[0].metric("Portfolio companies", f"{len(holdings)}", f"{int(holdings.is_listed.sum())} listed", delta_color="off")
+    c[1].metric(f"Dividends due {year} (RWF m)", f"{inc.fund_share_rwf_m.sum():,.1f}")
+    c[2].metric(f"Received {year} (RWF m)", f"{inc.received_rwf_m.sum():,.1f}")
+    c[3].metric("Overdue (RWF m)", f"{overdue.outstanding_rwf_m.sum():,.1f}", f"{len(overdue)} companies",
+                delta_color="off")
+    if len(overdue):
+        st.warning("Late payers: " + "; ".join(f"{r.company_name} ({r.outstanding_rwf_m:,.1f} m, "
+                                                f"{int(r.days_overdue)} days)" for r in overdue.itertuples()))
+    st.subheader(f"Dividends {year}: projected vs received (RWF m)")
+    st.dataframe(inc, hide_index=True, width="stretch")
+    st.subheader("Dividend income by fiscal year (RWF m)")
+    by_year = equity.dividends_by_year(dividends)
+    st.bar_chart(by_year[["declared_rwf_m", "received_rwf_m"]], stack=False)
+    st.subheader("Next three years: the 'same as last year' baseline (RWF m)")
+    base = equity.baseline_forecast(dividends, holdings)
+    st.caption("Total per year: " + " · ".join(f"{c} {base[c].sum():,.1f}" for c in base.columns if c.startswith("FY")))
+    st.dataframe(base, hide_index=True, width="stretch")
+    with st.expander(f"Holdings ({len(holdings)} companies)"):
+        st.dataframe(holdings, hide_index=True, width="stretch")
+
+
+def page_import(p: dict, user: dict) -> None:
+    st.header("Import data from Excel or CSV")
+    explain("""
+- Upload a **workbook** with one sheet per register (*Term Deposits*, *Treasury Bonds*, *Subsidiary Loans*,
+  *FX Rates*, *Dividends*…) or one **CSV** file. Sheet and column names are matched ignoring capitals,
+  spaces and symbols: "Deposit ID" → `deposit_id`.
+- **Fixes made automatically:** formatting with only one meaning: thousands separators, "10.5%" → 0.105,
+  dates such as 15/10/2026 (read day first), stray spaces, empty and TOTAL rows. Every fix is listed.
+- **Set aside (exceptions):** anything that needs judgement is never guessed: a rate typed as 10.8, a bank
+  that isn't approved, a missing date, a duplicate. Each row shows its Excel row number and who should fix it.
+- **Nothing is used until it is applied.** Checking an import changes nothing; only the finance office or an
+  Administrator can replace a register, and the previous version is kept as a backup.
+""")
+    if ingest is None:
+        st.info("Importing isn't in this copy of the platform yet. Run `python update_platform.py`, then restart.")
+        return
+    cfg = settings()
+    sample = Path(p["data_dir"]) / "sample_import.xlsx"
+    upload = st.file_uploader("Workbook (.xlsx) or CSV file", type=["xlsx", "csv"])
+    if sample.exists() and st.button("Try it with the sample workbook (messy on purpose)"):
+        st.session_state.import_sample = True
+    if upload is not None:
+        st.session_state.import_sample = False
+    source = upload if upload is not None else (sample if st.session_state.get("import_sample") else None)
+    if source is None:
+        st.info("Upload a file, or try the sample workbook to see cleaning and exceptions at work.")
+        return
+
+    name = getattr(source, "name", str(source))
+    if name.lower().endswith(".csv"):
+        names = [n for _, (n, _) in registry.REGISTERS.items()]
+        guess = ingest.register_for(name)
+        register = st.selectbox("Which register is this file?", names, index=names.index(guess) if guess else 0)
+        raw, ignored = {register: pd.read_csv(source, dtype=object)}, []
+    else:
+        raw, ignored = ingest.read_workbook(source)
+    if ignored:
+        st.caption("Sheets that don't match a register (ignored): " + ", ".join(ignored))
+    if not raw:
+        st.error("No sheet matches a register. Rename the sheets after the registers, e.g. Term Deposits, FX Rates.")
+        return
+
+    log = []
+    cleaned = {r: ingest.clean(df, r, log) for r, df in raw.items()}
+    accepted, exceptions = ingest.quarantine(cleaned, approved={"term_deposits": {"bank": pipeline.APPROVED_BANKS}})
+    fixes = pd.DataFrame(log, columns=["register", "excel_row", "column", "before", "after", "rule"])
+    summary = pd.DataFrame([{"register": r, "rows in file": len(raw[r]),
+                             "fixes made": int((fixes.register == r).sum()),
+                             "set aside": int(exceptions[exceptions.register == r].key.nunique()),
+                             "accepted": len(accepted.get(r, cleaned[r]))} for r in raw])
+    st.subheader(f"Checked: {name}")
+    st.dataframe(summary, hide_index=True, width="stretch")
+
+    for tab, r in zip(st.tabs([f"{r} ({int(summary.loc[summary.register == r, 'set aside'].iloc[0])} set aside)"
+                               for r in raw]), raw):
+        with tab:
+            ex = exceptions[exceptions.register == r]
+            st.markdown("**Set aside: correct these at the source and import again**")
+            if len(ex):
+                st.dataframe(ex.drop(columns=["register"]), hide_index=True, width="stretch")
+            else:
+                st.success("Nothing set aside." if r in ingest.CHECKED else
+                           "This register has no data contract yet, so rows are cleaned but not checked.")
+            st.markdown(f"**Fixes made automatically ({int((fixes.register == r).sum())})**")
+            st.dataframe(fixes[fixes.register == r].drop(columns=["register"]), hide_index=True, width="stretch")
+            rows = accepted.get(r, cleaned[r])
+            st.markdown(f"**Accepted rows ({len(rows)})**")
+            st.dataframe(rows, hide_index=True, width="stretch")
+            a, b = st.columns(2)
+            a.download_button("Download accepted rows (CSV)", rows.to_csv(index=False, date_format="%Y-%m-%d").encode(),
+                              f"{r}_accepted.csv", key=f"acc_{r}")
+            b.download_button("Download exceptions (CSV)", ex.to_csv(index=False).encode(), f"{r}_exceptions.csv",
+                              key=f"exc_{r}")
+
+    st.subheader("Use the accepted rows")
+    data_dir = Path(p["data_dir"]).resolve()
+    if cfg["demo_mode"]:
+        st.info("Public demo: nothing is saved. Download the accepted rows and the exceptions above.")
+    elif user["role"] not in CAN_REPLACE_REGISTERS:
+        st.info("Only the finance office or an Administrator can replace a register. Share the exceptions with "
+                "their owners, or ask the finance office to apply this import.")
+    elif HERE.resolve() not in [data_dir, *data_dir.parents]:
+        st.info(f"The data folder ({data_dir}) isn't part of this platform (here, the course materials), so it "
+                "is read-only. At work, set `data_dir` in config.yaml to your own folder next to app.py.")
+    else:
+        files = {n: f for f, (n, _) in registry.REGISTERS.items()}
+        pick = st.multiselect("Registers to replace with the accepted rows", list(accepted))
+        sure = st.checkbox("I have reviewed the exceptions. Rows set aside will NOT be included.")
+        if st.button("Replace registers", disabled=not (pick and sure), type="primary"):
+            backup = data_dir / "_backup" / dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup.mkdir(parents=True)
+            for r in pick:
+                target = data_dir / files[r]
+                if target.exists():
+                    shutil.copy2(target, backup / target.name)
+                accepted[r].to_csv(target, index=False, date_format="%Y-%m-%d")
+            st.cache_data.clear()
+            st.success(f"Replaced {', '.join(pick)}. The previous files are in {backup}. Every page now uses "
+                       "the new data.")
 
 
 def page_users(p: dict, user: dict) -> None:
@@ -400,9 +692,9 @@ def page_users(p: dict, user: dict) -> None:
             st.success(f"{email} is now {role}. They see the change the next time they sign in.")
 
 
-PAGES = {"Home": page_home, "Overview": page_overview, "Cash-flow plan": page_cashflow,
-         "Instruments": page_instruments, "Collections": page_collections, "Data quality": page_quality,
-         "Users": page_users}
+PAGES = {"Home": page_home, "How to use": page_help, "Overview": page_overview, "Cash-flow plan": page_cashflow,
+         "Instruments": page_instruments, "Collections": page_collections, "Equity & dividends": page_equity,
+         "Data quality": page_quality, "Import data": page_import, "Users": page_users}
 
 
 # ------------------------------------------------------------------ sign in / sign up (public landing page)
@@ -412,7 +704,9 @@ def sign_in_page() -> None:
     if demo:
         st.info("**Public demo.** Create an account with any role to explore what that role sees. All figures "
                 "are synthetic. Accounts are deleted whenever the app restarts.")
-    tab_home, tab_in, tab_up = st.tabs(["🏠 Home", "🔑 Sign in", "✨ Create account"])
+    tab_home, tab_help, tab_in, tab_up = st.tabs(["🏠 Home", "📖 How to use", "🔑 Sign in", "✨ Create account"])
+    with tab_help:
+        help_content(demo)
     with tab_in, st.form("signin"):
         email = st.text_input("Email")
         password = st.text_input("Password", type="password")
@@ -462,7 +756,8 @@ def main() -> None:
         else:
             as_of = str(cfg["as_of"])
             st.caption(f"As of {as_of}")
-        page = st.radio("Page", allowed, index=1 if len(allowed) > 1 else 0)
+        page = st.radio("Page", allowed, index=allowed.index("Overview") if "Overview" in allowed else 0)
+        st.caption("New here? Open **How to use**.")
         if st.button("Sign out"):
             del st.session_state["user"]
             st.rerun()

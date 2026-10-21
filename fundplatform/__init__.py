@@ -6,7 +6,9 @@ desk produces by hand today: payment schedules, cash vs accrual income, the 12-m
 plan, maturity alerts, upcoming collections, a data-quality scorecard and a lineage record.
 
 Modules, in the order data flows through them (see pipeline.py):
+  ingest      Excel/CSV in: cleaning rules, then accepted rows vs exceptions (rows set aside, with an owner)
   registry    read the registers and check them against their data contracts (contracts/*.json)
+  equity      equity holdings and dividends: projected vs received, overdue payers, a baseline forecast
   schedules   every future and past payment of every instrument (the "features" of this platform)
   fx          the exchange rate in effect on any date, as known at any date (point-in-time)
   cashflow    cash vs accrual income, the master cash-flow plan, budget vs actual variance
@@ -16,4 +18,4 @@ Modules, in the order data flows through them (see pipeline.py):
   pipeline    runs everything in dependency order, timing each step
   extensions  requirements YOU implement (Capstone Part 3)
 """
-__version__ = "1.0"
+__version__ = "1.1"

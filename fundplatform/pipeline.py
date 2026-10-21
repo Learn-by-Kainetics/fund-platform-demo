@@ -22,26 +22,25 @@ from pathlib import Path
 
 import pandas as pd
 
-from . import cashflow, extensions, fx, lineage, quality, registry, schedules, serving
+from . import cashflow, extensions, fx, ingest, lineage, quality, registry, schedules, serving
 
 APPROVED_BANKS = [f"Bank {c}" for c in "ABCDEFGHI"]
 
 
 # ------------------------------------------------------------------ steps: (function, depends on, reads, writes)
 def load_registers(ctx):
-    ctx["reg"] = registry.load_all(ctx["data_dir"])
+    ctx["cleaning_log"] = []                      # every fix ingest.clean made: register, row, before, after, rule
+    ctx["reg"] = registry.load_all(ctx["data_dir"], log=ctx["cleaning_log"])
 
 
 def validate_registers(ctx):
-    checks = {"term_deposits": ("term_deposit", "deposit_id"), "treasury_bonds": ("treasury_bond", "bond_id"),
-              "subsidiary_loans": ("subsidiary_loan", "loan_id")}
-    found = []
-    for name, (contract, key) in checks.items():
-        p = registry.validate(ctx["reg"][name], registry.contract(contract), key=key)
-        found.append(p.assign(register=name))
-    ctx["register_problems"] = pd.concat(found, ignore_index=True)
-    if len(ctx["register_problems"]):
-        raise ValueError(f"registers break their contracts:\n{ctx['register_problems']}")
+    """Contract checks. A row that breaks its contract is set aside (quarantined) with the reason and an owner,
+    instead of stopping the whole run: every other figure stays available, the bad row is left out of all of
+    them, and the scorecard and the Overview page say so until it is corrected at the source."""
+    checked = {name: df for name, df in ctx["reg"].items() if name in ingest.CHECKED}
+    accepted, ctx["exceptions"] = ingest.quarantine(checked, approved={"term_deposits": {"bank": APPROVED_BANKS}})
+    ctx["reg"].update(accepted)
+    ctx["register_problems"] = ctx["exceptions"]
 
 
 def build_schedules(ctx):
@@ -90,7 +89,8 @@ def score(ctx):
         dict(name="FX rate freshness (days)", value=fx_age, ok=fx_age <= 7, target="<= 7 days (rates entered weekly)",
              owner="Finance office", action="Enter the latest reference rates; USD figures are stale until then"),
         dict(name="Register contract problems", value=len(ctx["register_problems"]), ok=len(ctx["register_problems"]) == 0,
-             target="0", owner="Investment analyst", action="Fix the register rows listed by the pipeline"),
+             target="0", owner="Investment analyst",
+             action="Correct the rows under Exceptions (Data quality page); they are left out of every figure until then"),
         dict(name="Months collected >10% below budget", value=int(v.flag.sum()), ok=int(v.flag.sum()) == 0,
              target="0", owner="Finance manager", action="Review the variance report; chase arrears"),
         dict(name="Receivables payment-delay drift (PSI)", value=drift, ok=drift < 0.1, target="< 0.1 (stable)",
@@ -129,6 +129,9 @@ def write_outputs(ctx):
     tables = {"schedule_events": ctx["events_rwf"], f"cash_vs_accrual_{ctx['year']}": ctx["income"],
               f"master_cashflow_{ctx['year']}": ctx["master"], f"variance_{ctx['year']}": ctx["variance"],
               "instrument_status": ctx["status"], "scorecard": ctx["scorecard"], "board_summary": ctx["board"],
+              "exceptions": ctx["exceptions"].astype(str),
+              "cleaning_log": pd.DataFrame(ctx["cleaning_log"], columns=["register", "excel_row", "column", "before",
+                                                                         "after", "rule"]).astype(str),
               **ctx["extensions"]}
     serving.write_offline(tables, ctx["output_dir"])
 

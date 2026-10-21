@@ -36,11 +36,12 @@ from fundplatform import pipeline  # noqa: E402
 
 
 def find_data(configured: str) -> Path:
-    """The data folder: as configured, else the course's Day 3 data wherever this copy lives."""
+    """The data folder: as configured, else the course's Day 3 data wherever this copy lives.
+    A folder counts if it has term_deposits.csv or a registers*.xlsx workbook."""
     candidates = [HERE / configured, HERE.parent.parent / "data",                    # materials/day3/capstone/platform
                   HERE.parents[2] / "materials" / "day3" / "data"]                  # my_work/capstone/platform
     for c in candidates:
-        if (c / "term_deposits.csv").exists():
+        if (c / "term_deposits.csv").exists() or any(c.glob("registers*.xlsx")):
             return c.resolve()
     for c in candidates:                                                             # data not generated yet
         gen = c.parent / "scripts" / "generate_data.py"

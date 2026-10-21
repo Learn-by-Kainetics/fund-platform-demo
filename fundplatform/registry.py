@@ -1,9 +1,12 @@
 """
-Registers: the instrument "tables" the desk maintains, read from CSV (exported from Excel today,
-from a database later) and checked against their data contracts.
+Registers: the instrument "tables" the desk maintains, read from CSV files or an Excel workbook
+(from a database later), cleaned (ingest.py) and checked against their data contracts.
 
     reg = load_all("path/to/data")      # dict of DataFrames, dates parsed
     reg["term_deposits"].head()
+
+Where each register comes from, in order: <register>.csv in the data folder, else a sheet with the
+register's name in a workbook called registers*.xlsx in the same folder ("Term Deposits" -> term_deposits).
 """
 from __future__ import annotations
 
@@ -25,17 +28,26 @@ REGISTERS = {
     "receipts_2026.csv": ("receipts", ["pay_date", "received_on"]),
     "receivables.csv": ("receivables", ["due_date", "paid_date"]),
     "opening_position.csv": ("opening_position", ["date"]),
+    "equity_holdings.csv": ("equity_holdings", ["investment_date"]),
+    "dividends.csv": ("dividends", ["declared_on", "pay_date", "received_on"]),
 }
 
 
-def load_all(data_dir) -> dict[str, pd.DataFrame]:
-    """Read every register that exists in data_dir. Missing files are simply left out."""
+def load_all(data_dir, log: list | None = None) -> dict[str, pd.DataFrame]:
+    """Read and clean every register found in data_dir (CSV first, else a registers*.xlsx sheet).
+    Missing registers are simply left out. Each cleaning fix is appended to log (see ingest.clean)."""
+    from . import ingest
     data_dir = Path(data_dir)
+    workbook = {}
+    for book in sorted(data_dir.glob("registers*.xlsx")):
+        workbook.update(ingest.read_workbook(book)[0])
     out = {}
-    for file, (name, dates) in REGISTERS.items():
+    for file, (name, _) in REGISTERS.items():
         path = data_dir / file
         if path.exists():
-            out[name] = pd.read_csv(path, parse_dates=dates)
+            out[name] = ingest.clean(pd.read_csv(path), name, log)
+        elif name in workbook:
+            out[name] = ingest.clean(workbook[name], name, log)
     return out
 
 
