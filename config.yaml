@@ -1,0 +1,7 @@
+# Platform settings. Change them here, not in the code.
+as_of: "2026-10-21"        # "today" for alerts, freshness and arrears (fixed for the course; use today's date at work)
+year: 2026                 # the reporting year for income, the master plan and variance
+data_dir: "data"           # folder with the registers (CSV). If it doesn't exist here, run.py finds the course data
+output_dir: "output"       # where results are written (created if missing)
+learn_url: "https://kaineticslabs.com/learn"   # the "Learn with Kainetics Labs" link in the web app
+demo_mode: true           # true on a public website: visitors pick a role to explore; no Administrator, no user list
